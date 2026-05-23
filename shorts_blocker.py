@@ -1,9 +1,6 @@
 """
 YouTube Shorts Blocker - Windows Prototype
-Two-stage detection:
-  Stage 1: Read window title silently (no keypresses) — check if YouTube is open
-  Stage 2: Only THEN grab the URL — confirms it's exactly youtube.com/shorts/
-This prevents constant address bar interruptions while browsing other sites.
+Detects Shorts via window title — zero keypresses, zero interruptions.
 """
 
 import time
@@ -13,28 +10,25 @@ import sys
 import re
 import ctypes
 
-# ── Auto-install dependencies ──
 def _ensure(pkg, import_name=None):
-    name = import_name or pkg
     try:
-        __import__(name)
+        __import__(import_name or pkg)
     except ImportError:
         print(f"Installing {pkg}...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
 _ensure("psutil")
 _ensure("pyautogui")
-_ensure("pyperclip")
+_ensure("requests")
 
 import psutil
 import pyautogui
-import pyperclip
+import requests
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-CHECK_INTERVAL      = 2.0    # How often to run the title check (seconds)
-URL_GRAB_INTERVAL   = 2.0    # Min seconds between URL grabs (when on YouTube)
+CHECK_INTERVAL = 2.0
 
 BROWSER_PROCESS_NAMES = [
     "chrome.exe", "firefox.exe", "msedge.exe", "opera.exe", "brave.exe",
@@ -46,11 +40,10 @@ SHORTS_URL_PATTERN = re.compile(
 )
 
 # ─────────────────────────────────────────────
-# STAGE 1 — Silent title check (no keypresses)
+# WINDOW TITLE — zero keypresses
 # ─────────────────────────────────────────────
 
 def get_active_window_title() -> str:
-    """Read the window title bar — completely silent, no keypresses."""
     try:
         hwnd   = ctypes.windll.user32.GetForegroundWindow()
         length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
@@ -75,58 +68,62 @@ def is_browser_active() -> bool:
     return get_active_process_name() in BROWSER_PROCESS_NAMES
 
 
-def is_youtube_in_title() -> bool:
+def is_shorts_via_title(title: str) -> bool:
     """
-    Stage 1 gate: silently check if YouTube is likely open.
-    Browser titles look like:  'My Video - YouTube - Google Chrome'
-    This check costs zero keypresses — just reads the title bar.
+    Detect Shorts purely from the window title bar.
+
+    Real Shorts titles seen in the wild:
+      'Aura of Ishowspeed #shorts #ishowspeed - YouTube - Brave'
+      '#illustration #tattoo #art #pov - YouTube - Brave'
+      'YouTube Shorts - Brave'
+      'Zombies ARC #countryballs #edit - YouTube - Brave'  ← NOT shorts (no #shorts tag)
+
+    Rules:
+      1. Title must end with '- YouTube - <browser>' so we only match YouTube tabs
+      2. AND one of:
+           a. Contains '#shorts' anywhere in title
+           b. Title literally says 'YouTube Shorts' (Shorts homepage)
     """
-    title = get_active_window_title().lower()
-    return "youtube" in title
+    t = title.lower()
+
+    # Rule 1: must be a YouTube browser tab
+    is_youtube_tab = "- youtube -" in t or t.startswith("youtube shorts -")
+    if not is_youtube_tab:
+        return False
+
+    # Rule 2a: has the #shorts hashtag
+    if "#shorts" in t:
+        return True
+
+    # Rule 2b: is the Shorts homepage/feed
+    if "youtube shorts" in t:
+        return True
+
+    return False
 
 
 # ─────────────────────────────────────────────
-# STAGE 2 — URL grab (only runs when on YouTube)
+# DEBUG PORT (optional, more accurate)
 # ─────────────────────────────────────────────
 
-def get_current_url() -> str:
-    """
-    Grab the real URL from the address bar.
-    Only called after Stage 1 confirms YouTube is open,
-    so this interruption is rare and expected.
-    """
+def get_url_via_debug_port() -> str:
     try:
-        old_clipboard = ""
-        try:
-            old_clipboard = pyperclip.paste()
-        except Exception:
-            pass
-
-        pyautogui.hotkey("ctrl", "l")
-        time.sleep(0.15)
-        pyautogui.hotkey("ctrl", "c")
-        time.sleep(0.1)
-        pyautogui.press("escape")        # Immediately unfocus — barely noticeable
-        time.sleep(0.05)
-
-        url = pyperclip.paste().strip()
-
-        try:
-            if old_clipboard:
-                pyperclip.copy(old_clipboard)
-        except Exception:
-            pass
-
-        return url
-
-    except Exception as e:
-        print(f"  [URL READ ERROR] {e}")
+        resp = requests.get("http://127.0.0.1:9222/json", timeout=1.0)
+        for tab in resp.json():
+            if tab.get("type") == "page":
+                return tab.get("url", "")
+        return ""
+    except Exception:
         return ""
 
 
 def is_youtube_shorts_url(url: str) -> bool:
     return bool(SHORTS_URL_PATTERN.match(url))
 
+
+# ─────────────────────────────────────────────
+# CLOSE TAB
+# ─────────────────────────────────────────────
 
 def close_tab():
     try:
@@ -147,8 +144,8 @@ class ShortsBlocker:
         self.blocked_count     = 0
         self.on_status_update  = on_status_update
         self._thread           = None
-        self._last_blocked_url = ""
-        self._last_url_grab    = 0.0     # timestamp of last Ctrl+L grab
+        self._last_blocked_key = ""
+        self._debug_available  = None
 
     def start(self):
         self.running = True
@@ -158,47 +155,55 @@ class ShortsBlocker:
     def stop(self):
         self.running = False
 
+    def _check_debug_port(self) -> bool:
+        try:
+            requests.get("http://127.0.0.1:9222/json", timeout=1.0)
+            print("  [INFO] Debug port available — using exact URL detection")
+            return True
+        except Exception:
+            print("  [INFO] Debug port not available — using title bar detection")
+            return False
+
+    def _is_shorts(self) -> tuple:
+        """Returns (is_shorts: bool, key: str)"""
+
+        if self._debug_available is None:
+            self._debug_available = self._check_debug_port()
+
+        if self._debug_available:
+            url = get_url_via_debug_port()
+            if url:
+                result = is_youtube_shorts_url(url)
+                print(f"  [CDP] {url[:70]} → {'SHORTS' if result else 'ok'}")
+                return result, url
+            self._debug_available = None
+
+        # Title bar fallback
+        title = get_active_window_title()
+        result = is_shorts_via_title(title)
+        print(f"  [TITLE] {title[:70]} → {'SHORTS ✓' if result else 'ok'}")
+        return result, title
+
     def _monitor_loop(self):
         while self.running:
             try:
-                if not is_browser_active():
-                    # Not even a browser — skip everything silently
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+                if is_browser_active():
+                    detected, key = self._is_shorts()
 
-                # ── Stage 1: silent title check ──
-                if not is_youtube_in_title():
-                    # Browser is open but not on YouTube — do nothing
-                    print("  [STAGE1] Browser active, not YouTube — skipping URL grab")
-                    self._last_blocked_url = ""
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-
-                # ── Stage 2: YouTube is open — now grab the URL ──
-                now = time.time()
-                if now - self._last_url_grab < URL_GRAB_INTERVAL:
-                    # Too soon since last grab — wait
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-
-                self._last_url_grab = now
-                url = get_current_url()
-                print(f"  [STAGE2] URL grabbed: {url[:80]}")
-
-                if url and is_youtube_shorts_url(url):
-                    if url != self._last_blocked_url:
-                        self._last_blocked_url = url
-                        print(f"  [BLOCKED] Shorts confirmed: {url}")
-                        time.sleep(0.3)
-                        closed = close_tab()
-                        if closed:
-                            self.blocked_count += 1
-                            if self.on_status_update:
-                                self.on_status_update(
-                                    f"Blocked! ({self.blocked_count} total)"
-                                )
-                else:
-                    self._last_blocked_url = ""
+                    if detected:
+                        if key != self._last_blocked_key:
+                            self._last_blocked_key = key
+                            print(f"  [BLOCKED] Closing Shorts tab")
+                            time.sleep(0.3)
+                            closed = close_tab()
+                            if closed:
+                                self.blocked_count += 1
+                                if self.on_status_update:
+                                    self.on_status_update(
+                                        f"Blocked! ({self.blocked_count} total)"
+                                    )
+                    else:
+                        self._last_blocked_key = ""
 
             except Exception as e:
                 print(f"  [ERROR] {e}")
